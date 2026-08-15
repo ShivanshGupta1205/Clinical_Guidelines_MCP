@@ -12,7 +12,9 @@ An MCP server exposing public clinical guidelines (CDC/WHO/NIH) to an LLM client
 | WHO | Select guidelines via IRIS (`iris.who.int`) | No documented public API — manual curation: search, note handle URL, download PDF directly. 2–3 documents only, for cross-org comparison. | CC BY-NC-SA 3.0 IGO — non-commercial reuse w/ attribution OK |
 | NIH/NLM | NCBI Bookshelf (`db=books`) via E-utilities | Real REST API (`eutils.ncbi.nlm.nih.gov`). ESearch → EFetch, XML. 3 req/s anonymous, 10 req/s with free API key (register one). | Public domain |
 
-Target corpus: 5–8 source documents across 4–6 topics with clear structured elements (dosages, numeric thresholds) — e.g. opioid MME limits, adult immunization schedule, hypertension BP thresholds, antibiotic dosing. Do not attempt a comprehensive corpus. Do not touch MIMIC-III or any credentialed/PHI-adjacent dataset.
+Target corpus: **9 documents — 4 CDC, 3 WHO, 2 NIH/Bookshelf** — across topics with clear structured elements (dosages, numeric thresholds), chosen so at least 1–2 topics have real cross-org coverage (CDC + WHO/NIH) to support `compare_guidelines`. Expect ~400–800 chunks and ~70–130 structured-fact rows total. Do not attempt a comprehensive corpus. Do not touch MIMIC-III or any credentialed/PHI-adjacent dataset.
+
+Ingestion is a **real idempotent pipeline** (fetch → parse → chunk/embed → structured-fact staging → reviewed promotion to `structured_facts`), not a one-time script — it needs to re-run cleanly when a document is added or a source guideline is updated (see `superseded_by`). The structured-fact promotion step is a mandatory human-review checkpoint regardless of how automated the rest of the pipeline is — never auto-promote extracted dosage/threshold candidates straight to `structured_facts`.
 
 ## Architecture
 ```
