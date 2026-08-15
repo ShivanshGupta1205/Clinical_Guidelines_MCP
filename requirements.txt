@@ -1,0 +1,19 @@
+# Pinned per docs/PROJECT_BRIEF.md "Tech stack" section.
+# No implementation exists yet — see docs/LEARNING_LOG.md gate (CLAUDE.md).
+
+# MCP server
+mcp
+
+# Postgres + pgvector
+psycopg[binary]
+pgvector
+
+# Embeddings (local, no paid API — deliberate choice, see CLAUDE.md)
+sentence-transformers
+
+# Ingestion
+httpx
+pdfplumber
+
+# Testing
+pytest
