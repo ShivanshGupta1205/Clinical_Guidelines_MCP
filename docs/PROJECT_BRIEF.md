@@ -22,7 +22,7 @@ Ingestion pipeline (offline/batch)
   fetch → parse → chunk + embed → extract structured facts
         ↓
 Postgres + pgvector
-  guidelines | guideline_chunks | structured_facts | tool_call_log
+  guidelines | guideline_chunks | structured_facts_staging | structured_facts | tool_call_log
         ↓
 MCP server (Python, official mcp SDK)
   tools / resources / prompts / elicitation
@@ -31,46 +31,81 @@ MCP server (Python, official mcp SDK)
   Claude Desktop (manual)      Eval harness (scripted MCP client, CI)
 ```
 
-## DB schema
+## DB schema — finalized after critical review
+
+Decisions made deliberately during review, worth keeping in mind while building:
+- `topic` stays plain `TEXT`, assigned manually/consistently during curation (not a controlled vocab, not a tags table) — if manual consistency proves insufficient once `compare_guidelines` is actually being tested across orgs, the documented fallback is a semantic-matching layer, not a bigger schema.
+- `value` in `structured_facts` stays `TEXT`, not split into numeric fields — a deliberate simplicity tradeoff; it means no range-querying/validation on dosage values, accepted because much of this data (e.g. "IV artesunate followed by oral therapy") doesn't reduce to a clean number anyway.
+- `structured_facts_staging` exists specifically so nothing reaches `structured_facts` without human review — see the ingestion note above. Staging rows are NOT unique-constrained (duplicates across re-runs are fine, review handles it); the final table is.
+- `guideline_chunks.embedding` needs `pgvector`'s `CREATE EXTENSION vector;` run once, before this DDL.
+
 ```sql
+CREATE TYPE source_org_enum AS ENUM ('cdc', 'who', 'nih');
+
 CREATE TABLE guidelines (
-  guideline_id   TEXT PRIMARY KEY,
-  source_org     TEXT NOT NULL,           -- 'cdc' | 'who' | 'nih'
-  title          TEXT NOT NULL,
-  topic          TEXT NOT NULL,
-  publish_date   DATE,
-  source_url     TEXT NOT NULL,
-  superseded_by  TEXT REFERENCES guidelines(guideline_id),
-  ingested_at    TIMESTAMPTZ DEFAULT now()
+  guideline_id   TEXT PRIMARY KEY,                                -- human-readable ID, e.g. 'cdc-opioid-2022'
+  source_org     source_org_enum NOT NULL,                        -- which org published it
+  title          TEXT NOT NULL,                                   -- guideline title
+  topic          TEXT NOT NULL,                                   -- topic label, assigned manually & consistently at curation time
+  publish_date   DATE,                                            -- original publish date
+  source_url     TEXT NOT NULL,                                   -- hub/landing page URL
+  superseded_by  TEXT REFERENCES guidelines(guideline_id),        -- points to the newer version, if this one's outdated
+  ingested_at    TIMESTAMPTZ DEFAULT now()                        -- when this row was ingested
+  -- future: updated_at, reviewed_at — add once needed
 );
 
 CREATE TABLE guideline_chunks (
-  chunk_id       SERIAL PRIMARY KEY,
-  guideline_id   TEXT REFERENCES guidelines(guideline_id),
-  section        TEXT,
-  recommendation_number INT,
-  chunk_text     TEXT NOT NULL,
-  embedding      VECTOR(384)              -- match embedding model dim
+  chunk_id       SERIAL PRIMARY KEY,                                                  -- internal chunk ID (also preserves in-section order — see note below)
+  guideline_id   TEXT NOT NULL REFERENCES guidelines(guideline_id) ON DELETE CASCADE, -- parent guideline
+  section        TEXT,                                                                -- human-readable section label
+  section_url    TEXT,                                                                -- exact sub-page URL this chunk came from
+  chunk_text     TEXT NOT NULL,                                                       -- the chunked text
+  embedding      VECTOR(384)                                                          -- embedding vector — dimension must match your model
+);
+-- chunk_id doubles as ordering within a (guideline_id, section) group, AS LONG AS
+-- ingestion always inserts a section's chunks in reading order — true for a
+-- single-threaded pipeline, which is the plan. No separate chunk_index column.
+
+CREATE INDEX guideline_chunks_embedding_idx
+  ON guideline_chunks USING hnsw (embedding vector_cosine_ops);   -- ANN index for semantic search, cosine distance
+
+CREATE TABLE structured_facts_staging (
+  staging_id     SERIAL PRIMARY KEY,                                                  -- staging row ID
+  guideline_id   TEXT NOT NULL REFERENCES guidelines(guideline_id) ON DELETE CASCADE, -- parent guideline
+  subject        TEXT NOT NULL,                                                       -- drug/topic the fact is about
+  indication     TEXT,                                                                -- condition/use-case the value applies to
+  population     TEXT,                                                                -- patient population it applies to (e.g. "pediatric")
+  value          TEXT NOT NULL,                                                       -- extracted dose/threshold, as text
+  unit           TEXT,                                                                -- unit for the value
+  source_section TEXT,                                                                -- human-readable section label
+  source_url     TEXT,                                                                -- exact sub-page URL the fact was pulled from
+  status         TEXT NOT NULL DEFAULT 'pending',                                     -- 'pending' | 'approved' | 'rejected'
+  reviewed_by    TEXT,                                                                -- who reviewed it
+  reviewed_at    TIMESTAMPTZ                                                          -- when it was reviewed
 );
 
-CREATE TABLE structured_facts (               -- the "not pure RAG" table
-  fact_id        SERIAL PRIMARY KEY,
-  guideline_id   TEXT REFERENCES guidelines(guideline_id),
-  subject        TEXT NOT NULL,
-  indication     TEXT,                    -- population/condition, nullable on purpose
-  value          TEXT NOT NULL,
-  unit           TEXT,
-  source_section TEXT
+CREATE TABLE structured_facts (               -- the "not pure RAG" table — promoted from staging only
+  fact_id        SERIAL PRIMARY KEY,                                                  -- final fact ID
+  guideline_id   TEXT NOT NULL REFERENCES guidelines(guideline_id) ON DELETE CASCADE, -- parent guideline
+  subject        TEXT NOT NULL,                                                       -- drug/topic the fact is about
+  indication     TEXT,                                                                -- condition/use-case the value applies to
+  population     TEXT,                                                                -- patient population it applies to
+  value          TEXT NOT NULL,                                                       -- dose/threshold, as text
+  unit           TEXT,                                                                -- unit for the value
+  source_section TEXT,                                                                -- human-readable section label
+  source_url     TEXT,                                                                -- exact sub-page URL the fact was pulled from
+  UNIQUE (guideline_id, subject, indication, population)                              -- blocks duplicate facts on re-ingestion
 );
 
 CREATE TABLE tool_call_log (
-  id             SERIAL PRIMARY KEY,
-  ts             TIMESTAMPTZ DEFAULT now(),
-  tool_name      TEXT,
-  params         JSONB,
-  latency_ms     INT,
-  result_count   INT,
-  elicitation_triggered BOOLEAN DEFAULT false
+  id             SERIAL PRIMARY KEY,                -- log row ID
+  ts             TIMESTAMPTZ DEFAULT now(),          -- when the call happened
+  tool_name      TEXT,                               -- which MCP tool was called
+  params         JSONB,                              -- the call's parameters
+  latency_ms     INT,                                -- how long the call took
+  result_count   INT,                                -- how many results were returned
+  elicitation_triggered BOOLEAN DEFAULT false,        -- whether elicitation fired
+  session_id     TEXT                                 -- MCP session ID — unused/null until Streamable HTTP, deferred
 );
 ```
 
@@ -87,8 +122,8 @@ CREATE TABLE tool_call_log (
 ### Tool signatures
 ```python
 search_guidelines(query: str, source_org: str | None, topic: str | None, top_k: int = 5)
-get_recommendation(guideline_id: str, recommendation_number: int)
-lookup_dosage(drug_or_topic: str, indication: str | None = None)
+get_section(guideline_id: str, section: str)              # renamed from get_recommendation — recommendation_number was dropped from the schema; the CDC hub-page corpus never had numbered recs anyway
+lookup_dosage(drug_or_topic: str, indication: str | None = None, population: str | None = None)
 compare_guidelines(topic: str, orgs: list[str])          # week-2 stretch
 list_guidelines(topic: str | None = None)
 ```
@@ -112,6 +147,7 @@ Do not reuse a RAG-only eval framework (Ragas etc.) as-is — this evaluates too
 - Transport: stdio → Streamable HTTP; auth is API key for MVP, OAuth 2.1 only if it becomes genuinely multi-user
 
 ## Phases (each gated by LEARNING_LOG.md — see CLAUDE.md)
+0. **DB connection & schema setup** (first step, day 1) — connect to Postgres, run the finalized DDL above. The relational tables (`guidelines`, `structured_facts_staging`, `structured_facts`, `tool_call_log`) don't need a learning-gate check — this is plain SQL/DDL, an existing skill, not new ground. `guideline_chunks.embedding` and its HNSW index specifically DO wait on M2 (pgvector/embeddings) clearing, since that's the actually-new part. Split the DDL into two migration steps if useful — one gate-free, one gated.
 1. **Data & ingestion** (days 1–4) — fetch, parse, chunk, embed, extract structured facts
 2. **MCP core** (days 5–7) — tools, resources, one prompt, stdio server working in Claude Desktop
 3. **Evaluation** (days 8–10) — golden set, harness, telemetry logging
