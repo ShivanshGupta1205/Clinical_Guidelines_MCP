@@ -1,28 +1,39 @@
-# PROJECT_BRIEF.md — Clinical Guideline MCP Server
+# PROJECT_BRIEF.md — Drug Information MCP Server
 
-Read this alongside `CLAUDE.md` (operating rules for this session) and `LEARNING_LOG.md` (the gate — check it before implementing anything). This brief is the full technical spec; `CLAUDE.md` governs how you're allowed to act on it.
+Read this alongside `CLAUDE.md` (operating rules) and `LEARNING_LOG.md` (build/learning journal). This brief is the technical spec — the north star. `DECISIONS.md` records *why* the major choices were made.
+
+> Repo/package name is still `Clinical-Guidelines-MCP` / `clinical_guidelines_mcp` for now (see DECISIONS.md D8). The *subject* has changed from CDC clinical guidelines to **FDA drug information via openFDA**.
 
 ## What this is
-An MCP server exposing public clinical guidelines (CDC/WHO/NIH) to an LLM client via two retrieval paths — structured lookup (dosages, thresholds — exact, deterministic) and semantic search (embedded chunks — fuzzy, explanatory). Portfolio project. Owner is learning the underlying concepts deliberately, not just shipping — see the gating rule in `CLAUDE.md`.
+An **MCP server** that exposes public FDA drug information to an LLM client through a set of tools. It deliberately mixes two retrieval styles:
+- **Structured / exact lookup** — facts read straight from structured data (ingredient strengths, adverse-event counts, recalls). Deterministic, no guessing. *This is the core.*
+- **Semantic search** — fuzzy, meaning-based search over free-text label sections (warnings, indications). Useful but secondary.
 
-## Data sources
-| Source | What | Access | License |
-|---|---|---|---|
-| CDC | MMWR "Recommendations and Reports" series — e.g. 2022 opioid prescribing guideline | HTML/PDF fetch, no API. Stable URLs under `cdc.gov/mmwr/rr/`. Well-structured (numbered recs, consistent sections) → deterministic parsing, not LLM extraction. | Public domain (17 U.S.C. §105) |
-| WHO | Select guidelines via IRIS (`iris.who.int`) | No documented public API — manual curation: search, note handle URL, download PDF directly. 2–3 documents only, for cross-org comparison. | CC BY-NC-SA 3.0 IGO — non-commercial reuse w/ attribution OK |
-| NIH/NLM | NCBI Bookshelf (`db=books`) via E-utilities | Real REST API (`eutils.ncbi.nlm.nih.gov`). ESearch → EFetch, XML. 3 req/s anonymous, 10 req/s with free API key (register one). | Public domain |
+Plus the MCP-specific feature that plain RAG cannot do: **elicitation** — the server asks the client a clarifying question (e.g. which drug product / population) before answering.
 
-Target corpus: **9 documents — 4 CDC, 3 WHO, 2 NIH/Bookshelf** — across topics with clear structured elements (dosages, numeric thresholds), chosen so at least 1–2 topics have real cross-org coverage (CDC + WHO/NIH) to support `compare_guidelines`. Expect ~400–800 chunks and ~70–130 structured-fact rows total. Do not attempt a comprehensive corpus. Do not touch MIMIC-III or any credentialed/PHI-adjacent dataset.
+Portfolio project, meant to hold up under interview questioning. The emphasis (exact-lookup + elicitation first, semantic search second) is deliberate — it's what makes this an MCP project rather than a RAG demo. See DECISIONS.md D3/D4.
 
-Ingestion is a **real idempotent pipeline** (fetch → parse → chunk/embed → structured-fact staging → reviewed promotion to `structured_facts`), not a one-time script — it needs to re-run cleanly when a document is added or a source guideline is updated (see `superseded_by`). The structured-fact promotion step is a mandatory human-review checkpoint regardless of how automated the rest of the pipeline is — never auto-promote extracted dosage/threshold candidates straight to `structured_facts`.
+## Data source — openFDA
+openFDA is the FDA's free, public data service. It returns clean JSON over HTTP — **no scraping, no PDF parsing**. Base URL: `https://api.fda.gov/`. Free API key is optional (raises daily rate limit to ~120k/day; ~1k/day without).
+
+| Endpoint | What it gives | Retrieval style it feeds |
+|---|---|---|
+| `/drug/label.json` | Official drug label, split into named sections (`indications_and_usage`, `dosage_and_administration`, `warnings`, `boxed_warning`, `contraindications`, `adverse_reactions`, `drug_interactions`, `use_in_specific_populations`, `overdosage`, …). Section names are structured; text inside is free-form. | **Semantic search** (free-text sections) |
+| `/drug/ndc.json` | National Drug Code directory. Truly structured fields: `active_ingredients` (name + strength), `dosage_form`, `route`, `product_type`, packaging. | **Exact lookup** (structured facts) |
+| `/drug/event.json` | Adverse-event reports (FAERS). With `count=`, returns ranked **counts** of reactions per drug. | **Exact lookup** (real numbers) |
+| `/drug/enforcement.json` | Drug recalls (what, why, severity). | **Exact lookup** (structured records) |
+
+Harmonized identifiers across endpoints (so the same drug can be matched everywhere): `generic_name`, `brand_name`, `product_ndc`, `spl_set_id`, `route`, `dosage_form`, `product_type`, `rxcui`, `unii`.
+
+**Corpus is curated/pinned, not crawled** (DECISIONS.md D2): a deliberately chosen set of ~15–30 drugs across a few therapeutic areas, so the eval harness runs against a fixed, reproducible set. "Deliberately scoped," never "comprehensive." Not medical advice — openFDA's own disclaimer is baked into the server prompt.
 
 ## Architecture
 ```
-Ingestion pipeline (offline/batch)
-  fetch → parse → chunk + embed → extract structured facts
+Ingestion (offline/batch)
+  openFDA API (httpx) → normalize JSON → write structured facts + label sections
         ↓
 Postgres + pgvector
-  guidelines | guideline_chunks | structured_facts_staging | structured_facts | tool_call_log
+  drugs | drug_facts | drug_label_sections | adverse_event_counts | recalls | tool_call_log
         ↓
 MCP server (Python, official mcp SDK)
   tools / resources / prompts / elicitation
@@ -31,127 +42,114 @@ MCP server (Python, official mcp SDK)
   Claude Desktop (manual)      Eval harness (scripted MCP client, CI)
 ```
 
-## DB schema — finalized after critical review
-
-Decisions made deliberately during review, worth keeping in mind while building:
-- `topic` stays plain `TEXT`, assigned manually/consistently during curation (not a controlled vocab, not a tags table) — if manual consistency proves insufficient once `compare_guidelines` is actually being tested across orgs, the documented fallback is a semantic-matching layer, not a bigger schema.
-- `value` in `structured_facts` stays `TEXT`, not split into numeric fields — a deliberate simplicity tradeoff; it means no range-querying/validation on dosage values, accepted because much of this data (e.g. "IV artesunate followed by oral therapy") doesn't reduce to a clean number anyway.
-- `structured_facts_staging` exists specifically so nothing reaches `structured_facts` without human review — see the ingestion note above. Staging rows are NOT unique-constrained (duplicates across re-runs are fine, review handles it); the final table is.
-- `guideline_chunks.embedding` needs `pgvector`'s `CREATE EXTENSION vector;` run once, before this DDL.
-
+## DB schema (draft — refine while building)
 ```sql
-CREATE TYPE source_org_enum AS ENUM ('cdc', 'who', 'nih');
-
-CREATE TABLE guidelines (
-  guideline_id   TEXT PRIMARY KEY,                                -- human-readable ID, e.g. 'cdc-opioid-2022'
-  source_org     source_org_enum NOT NULL,                        -- which org published it
-  title          TEXT NOT NULL,                                   -- guideline title
-  topic          TEXT NOT NULL,                                   -- topic label, assigned manually & consistently at curation time
-  publish_date   DATE,                                            -- original publish date
-  source_url     TEXT NOT NULL,                                   -- hub/landing page URL
-  superseded_by  TEXT REFERENCES guidelines(guideline_id),        -- points to the newer version, if this one's outdated
-  ingested_at    TIMESTAMPTZ DEFAULT now()                        -- when this row was ingested
-  -- future: updated_at, reviewed_at — add once needed
+CREATE TABLE drugs (
+  drug_id        TEXT PRIMARY KEY,        -- deterministic, from a stable openFDA id (e.g. spl_set_id or product_ndc)
+  generic_name   TEXT,
+  brand_name     TEXT,
+  product_ndc    TEXT,
+  spl_set_id     TEXT,
+  product_type   TEXT,                    -- 'HUMAN PRESCRIPTION DRUG' | 'HUMAN OTC DRUG' | ...
+  route          TEXT,
+  dosage_form    TEXT,
+  source_url     TEXT,
+  ingested_at    TIMESTAMPTZ DEFAULT now()
 );
 
-CREATE TABLE guideline_chunks (
-  chunk_id       SERIAL PRIMARY KEY,                                                  -- internal chunk ID (also preserves in-section order — see note below)
-  guideline_id   TEXT NOT NULL REFERENCES guidelines(guideline_id) ON DELETE CASCADE, -- parent guideline
-  section        TEXT,                                                                -- human-readable section label
-  section_url    TEXT,                                                                -- exact sub-page URL this chunk came from
-  chunk_text     TEXT NOT NULL,                                                       -- the chunked text
-  embedding      VECTOR(384)                                                          -- embedding vector — dimension must match your model
-);
--- chunk_id doubles as ordering within a (guideline_id, section) group, AS LONG AS
--- ingestion always inserts a section's chunks in reading order — true for a
--- single-threaded pipeline, which is the plan. No separate chunk_index column.
-
-CREATE INDEX guideline_chunks_embedding_idx
-  ON guideline_chunks USING hnsw (embedding vector_cosine_ops);   -- ANN index for semantic search, cosine distance
-
-CREATE TABLE structured_facts_staging (
-  staging_id     SERIAL PRIMARY KEY,                                                  -- staging row ID
-  guideline_id   TEXT NOT NULL REFERENCES guidelines(guideline_id) ON DELETE CASCADE, -- parent guideline
-  subject        TEXT NOT NULL,                                                       -- drug/topic the fact is about
-  indication     TEXT,                                                                -- condition/use-case the value applies to
-  population     TEXT,                                                                -- patient population it applies to (e.g. "pediatric")
-  value          TEXT NOT NULL,                                                       -- extracted dose/threshold, as text
-  unit           TEXT,                                                                -- unit for the value
-  source_section TEXT,                                                                -- human-readable section label
-  source_url     TEXT,                                                                -- exact sub-page URL the fact was pulled from
-  status         TEXT NOT NULL DEFAULT 'pending',                                     -- 'pending' | 'approved' | 'rejected'
-  reviewed_by    TEXT,                                                                -- who reviewed it
-  reviewed_at    TIMESTAMPTZ                                                          -- when it was reviewed
+CREATE TABLE drug_facts (                 -- the exact-lookup / "not RAG" table (from /drug/ndc)
+  fact_id        SERIAL PRIMARY KEY,
+  drug_id        TEXT REFERENCES drugs(drug_id) ON DELETE CASCADE,
+  subject        TEXT NOT NULL,           -- e.g. active ingredient name
+  value          TEXT NOT NULL,           -- e.g. strength value
+  unit           TEXT,                    -- e.g. 'mg'
+  kind           TEXT                     -- 'active_ingredient' | 'strength' | ...
 );
 
-CREATE TABLE structured_facts (               -- the "not pure RAG" table — promoted from staging only
-  fact_id        SERIAL PRIMARY KEY,                                                  -- final fact ID
-  guideline_id   TEXT NOT NULL REFERENCES guidelines(guideline_id) ON DELETE CASCADE, -- parent guideline
-  subject        TEXT NOT NULL,                                                       -- drug/topic the fact is about
-  indication     TEXT,                                                                -- condition/use-case the value applies to
-  population     TEXT,                                                                -- patient population it applies to
-  value          TEXT NOT NULL,                                                       -- dose/threshold, as text
-  unit           TEXT,                                                                -- unit for the value
-  source_section TEXT,                                                                -- human-readable section label
-  source_url     TEXT,                                                                -- exact sub-page URL the fact was pulled from
-  UNIQUE (guideline_id, subject, indication, population)                              -- blocks duplicate facts on re-ingestion
+CREATE TABLE drug_label_sections (        -- the semantic-search leg (from /drug/label)
+  section_id     SERIAL PRIMARY KEY,
+  drug_id        TEXT REFERENCES drugs(drug_id) ON DELETE CASCADE,
+  section        TEXT NOT NULL,           -- e.g. 'warnings', 'indications_and_usage'
+  section_text   TEXT NOT NULL,
+  embedding      VECTOR(384)              -- nullable; filled in the embeddings phase
 );
 
-CREATE TABLE tool_call_log (
-  id             SERIAL PRIMARY KEY,                -- log row ID
-  ts             TIMESTAMPTZ DEFAULT now(),          -- when the call happened
-  tool_name      TEXT,                               -- which MCP tool was called
-  params         JSONB,                              -- the call's parameters
-  latency_ms     INT,                                -- how long the call took
-  result_count   INT,                                -- how many results were returned
-  elicitation_triggered BOOLEAN DEFAULT false,        -- whether elicitation fired
-  session_id     TEXT                                 -- MCP session ID — unused/null until Streamable HTTP, deferred
+CREATE TABLE adverse_event_counts (       -- exact numbers (from /drug/event count=)
+  id             SERIAL PRIMARY KEY,
+  drug_id        TEXT REFERENCES drugs(drug_id) ON DELETE CASCADE,
+  reaction       TEXT NOT NULL,
+  report_count   INT NOT NULL
+);
+
+CREATE TABLE recalls (                     -- exact records (from /drug/enforcement)
+  id             SERIAL PRIMARY KEY,
+  drug_id        TEXT REFERENCES drugs(drug_id) ON DELETE CASCADE,
+  reason         TEXT,
+  classification TEXT,                    -- recall severity class
+  status         TEXT,
+  recall_date    DATE
+);
+
+CREATE TABLE tool_call_log (               -- telemetry
+  id             SERIAL PRIMARY KEY,
+  ts             TIMESTAMPTZ DEFAULT now(),
+  tool_name      TEXT,
+  params         JSONB,
+  latency_ms     INT,
+  result_count   INT,
+  elicitation_triggered BOOLEAN DEFAULT false
 );
 ```
+
+Revision strategy: whole-drug replacement (delete the `drugs` row → cascades to facts/sections/events/recalls → re-ingest). `drug_id` is deterministic so re-ingestion targets the same row.
 
 ## MCP capabilities — build decisions
 | Primitive | Build? | Notes |
 |---|---|---|
 | Tools | Yes, core | See signatures below |
-| Resources | Yes, lean | `guideline://{org}/{guideline_id}` and `.../rec/{n}` — cleaned markdown + metadata |
-| Prompts | Yes, 1–2 | `clinical_query`, `guideline_summary` (bakes in "not a substitute for clinical judgment") |
-| Sampling | Stretch | Server-initiated disambiguation of ambiguous `lookup_dosage` matches. Client support inconsistent — design for it, don't depend on it. |
-| Elicitation | Stretch, high value | Multi-round-trip, formalized in MCP 2026-07-28 spec. Use on `lookup_dosage` when `indication` is missing and dose depends on population. |
-| Roots | Skip, explicitly | Not applicable — no reason to browse client filesystem. State this decision in the README, don't just omit it silently. |
+| Elicitation | **Yes, core** (promoted from stretch) | The differentiator. Ask for the specific drug product / population before answering. |
+| Resources | Yes, lean | `drug://ndc/{product_ndc}` and `drug://label/{drug_id}/{section}` — structured facts + cleaned section text |
+| Prompts | Yes, 1–2 | `drug_query`, `drug_summary` (bakes in openFDA's "not medical advice" disclaimer) |
+| Sampling | Stretch | Server-initiated disambiguation where a client supports it. Design for it, don't depend on it. |
+| Roots | Skip, explicitly | No reason to browse client filesystem. State this decision in the README. |
 
-### Tool signatures
+### Tool signatures (exact-lookup + elicitation first; semantic second)
 ```python
-search_guidelines(query: str, source_org: str | None, topic: str | None, top_k: int = 5)
-get_section(guideline_id: str, section: str)              # renamed from get_recommendation — recommendation_number was dropped from the schema; the CDC hub-page corpus never had numbered recs anyway
-lookup_dosage(drug_or_topic: str, indication: str | None = None, population: str | None = None)
-compare_guidelines(topic: str, orgs: list[str])          # week-2 stretch
-list_guidelines(topic: str | None = None)
+# --- Core: exact lookup + elicitation (build first) ---
+find_drug(name: str)                                   # resolve name -> product(s); elicits on ambiguity
+get_dosing(drug: str, population: str | None = None)   # strength/form/route (structured) + dosing; elicits population
+top_adverse_events(drug: str, top_k: int = 10)         # ranked counts from FAERS (pure exact numbers)
+check_recalls(drug: str)                               # structured recall records
+
+# --- Secondary: semantic search (build after embeddings) ---
+search_label(drug: str, question: str, top_k: int = 5) # fuzzy search over free-text label sections
+
+# --- Stretch ---
+compare_drugs(drug_a: str, drug_b: str, aspect: str)   # e.g. compare warnings / adverse-event profiles
 ```
 
 ## Eval harness requirements
-Scripted MCP client (not Claude Desktop UI) runs a hand-written golden set (40–60 queries) through the server, scoring separately:
-- tool selection accuracy
-- parameter extraction accuracy
-- answer correctness (exact match for structured facts; LLM-as-judge w/ fixed faithfulness+relevance rubric for semantic answers)
-- elicitation precision (correctly triggers on the ambiguous subset, doesn't on the rest)
+Scripted MCP client (not the Claude Desktop UI) runs a hand-written golden set (40–60 queries), scoring separately:
+- tool selection accuracy (did it pick the right tool?)
+- parameter extraction accuracy (did it fill the tool's inputs right?)
+- answer correctness (exact match for structured facts; LLM-as-judge with a fixed faithfulness+relevance rubric for semantic answers)
+- elicitation precision (triggers on the ambiguous subset, not on the rest)
 - latency
 
-Do not reuse a RAG-only eval framework (Ragas etc.) as-is — this evaluates tool-call correctness, not just retrieval, and that harness is written custom on purpose.
+Do not reuse a RAG-only eval framework as-is — this measures tool-call correctness, not just retrieval.
 
 ## Tech stack (pinned)
 - Python + official `mcp` SDK
 - Postgres + pgvector
-- Embeddings: local sentence-transformers model (small BGE variant) — no paid API, deliberate cost/tradeoff choice
-- Ingestion: `httpx`/`requests` + `pdfplumber`; raw E-utilities calls for NCBI
-- Testing: `pytest` for tools; eval harness wired into GitHub Actions on push
+- Embeddings: local sentence-transformers model (small BGE variant) — no paid API (DECISIONS.md D6)
+- Ingestion: `httpx` against openFDA JSON endpoints
+- Testing: `pytest` per tool; eval harness wired into GitHub Actions
 - Transport: stdio → Streamable HTTP; auth is API key for MVP, OAuth 2.1 only if it becomes genuinely multi-user
 
-## Phases (each gated by LEARNING_LOG.md — see CLAUDE.md)
-0. **DB connection & schema setup** (first step, day 1) — connect to Postgres, run the finalized DDL above. The relational tables (`guidelines`, `structured_facts_staging`, `structured_facts`, `tool_call_log`) don't need a learning-gate check — this is plain SQL/DDL, an existing skill, not new ground. `guideline_chunks.embedding` and its HNSW index specifically DO wait on M2 (pgvector/embeddings) clearing, since that's the actually-new part. Split the DDL into two migration steps if useful — one gate-free, one gated.
-1. **Data & ingestion** (days 1–4) — fetch, parse, chunk, embed, extract structured facts
-2. **MCP core** (days 5–7) — tools, resources, one prompt, stdio server working in Claude Desktop
-3. **Evaluation** (days 8–10) — golden set, harness, telemetry logging
-4. **Deployment** (days 11–12) — Streamable HTTP, containerize, deploy
-5. **Scaling & ops** (days 13–14, stretch) — caching, index tuning, elicitation, versioning/monitoring
-
-Days 1–7 are the real MVP. Everything after is what elevates it.
+## Phases (code-first; exact-lookup + MCP core prioritized)
+1. **Ingestion** — fetch label + ndc (+ event, enforcement) for the curated drug set; normalize; write `drugs`, `drug_facts`, `drug_label_sections` (embedding NULL), `adverse_event_counts`, `recalls`.
+2. **MCP core (exact + elicitation)** — `find_drug`, `get_dosing`, `top_adverse_events`, `check_recalls`; stdio server working in Claude Desktop; elicitation on ambiguous drug/population.
+3. **Semantic leg** — generate embeddings; `search_label`; resources + one prompt.
+4. **Evaluation** — golden set, harness, telemetry logging.
+5. **Deployment** — Streamable HTTP, containerize, deploy.
+6. **Stretch** — `compare_drugs`, caching/index tuning, versioning/monitoring.

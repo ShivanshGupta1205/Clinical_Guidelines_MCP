@@ -1,0 +1,32 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# ---- Virtual environments ----
+.venv/
+venv/
+env/
+
+# ---- Secrets / local config ----
+.env
+.env.*
+!.env.example
+
+# ---- Editor / IDE ----
+.idea/
+.vscode/
+
+# ---- macOS ----
+.DS_Store
+
+# ---- Project-local data / caches ----
+# Raw API payloads or model caches we don't want in git
+data/raw/
+*.sqlite

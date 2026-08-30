@@ -1,49 +1,26 @@
-# LEARNING_LOG.md
+# LEARNING_LOG.md — build & learning journal
 
-Shared gate between the teaching project (Claude.ai) and the build session (Claude Code). Claude Code checks this file before writing implementation code for any phase — see `CLAUDE.md`. The teaching project updates this file conceptually; you paste its output back in here and commit.
+A running record of what got built, what concept it taught, and what tripped us up. This is code-first: we learn by building, then reflect here.
 
-Two independent gates per module:
-- **Concept cleared** — you can explain the idea correctly in your own words / passed the teacher's check. Set by the teaching project.
-- **Implementation understood** — you can explain what the actually-generated code does and why, line by line if asked. Set after a teach-back walkthrough of real code, once it exists.
+> History: this file started as a two-gate table (concept cleared / implementation understood) for the earlier CDC teaching-project workflow. That gate is retired (see DECISIONS.md D9). Kept as a journal because being able to *talk about what you learned* is worth a lot in interviews.
 
-A module isn't done until both columns are filled. Don't hand-edit either column yourself outside of pasting an exact line the teaching project gave you — the point is that these are earned, not self-certified.
+## How to use it
+After building a meaningful piece, add an entry:
 
-## Phase 1 — Data & Ingestion (days 1–4)
+```
+### <date> — <what you built>
+- **Built:** one line on the actual thing (file/function/tool).
+- **Concept it taught:** the idea you now understand because you built it.
+- **Tripped me up:** the bug, confusion, or wrong turn — and how it resolved.
+- **Could explain in an interview?** yes / not yet
+```
 
-| Module | Concept cleared | Implementation understood | Notes |
-|---|---|---|---|
-| M1. Document parsing & chunking strategy | Not started | Not started | |
-| M2. Embeddings & vector similarity (pgvector) | Not started | Not started | |
-| M3. Structured vs. semantic retrieval — when each is correct | Not started | Not started | |
+## Entries
 
-## Phase 2 — MCP Core (days 5–7)
+### 2026-08-30 — Project pivot (CDC → openFDA) + repo cleanup
+- **Built:** Nothing runnable yet. Reset the repo for the new direction: cleaned junk, trimmed deps, rewrote the brief, added a decisions log.
+- **Concept it taught:** Data-source quality decides project difficulty more than the concept does. A clean API (openFDA) beats scraping (CDC) for the same skills.
+- **Tripped me up:** Spent a week on CDC theory with no code and a painful, structureless data source. Fix: code-first, and pick sources with real APIs.
+- **Could explain in an interview?** yes (this is a good "what would you do differently" story)
 
-| Module | Concept cleared | Implementation understood | Notes |
-|---|---|---|---|
-| M4. MCP protocol primitives — tools / resources / prompts, capability negotiation | Not started | Not started | |
-| M5. Sampling & elicitation — what they're for, why roots is being skipped here | Not started | Not started | |
-
-## Phase 3 — Evaluation (days 8–10)
-
-| Module | Concept cleared | Implementation understood | Notes |
-|---|---|---|---|
-| M6. Eval design — tool selection vs. parameter accuracy vs. answer correctness as separate metrics | Not started | Not started | |
-| M7. Telemetry & logging design — what to log and why | Not started | Not started | |
-
-## Phase 4 — Deployment (days 11–12)
-
-| Module | Concept cleared | Implementation understood | Notes |
-|---|---|---|---|
-| M8. Transport — stdio vs. Streamable HTTP | Not started | Not started | |
-| M9. Auth — API keys vs. OAuth 2.1, when each is appropriate | Not started | Not started | |
-
-## Phase 5 — Scaling & Ops (days 13–14, stretch)
-
-| Module | Concept cleared | Implementation understood | Notes |
-|---|---|---|---|
-| M10. Caching & indexing tradeoffs (ivfflat/hnsw, semantic cache) | Not started | Not started | |
-| M11. Session state & horizontal scaling | Not started | Not started | |
-| M12. Versioning & regression monitoring | Not started | Not started | |
-
----
-*Last synced from teaching project: (never)*
+<!-- next entry: Phase 1 ingestion — first real openFDA fetch -->

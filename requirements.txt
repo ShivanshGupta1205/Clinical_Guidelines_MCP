@@ -1,5 +1,4 @@
 # Pinned per docs/PROJECT_BRIEF.md "Tech stack" section.
-# No implementation exists yet — see docs/LEARNING_LOG.md gate (CLAUDE.md).
 
 # MCP server
 mcp
@@ -8,12 +7,11 @@ mcp
 psycopg[binary]
 pgvector
 
-# Embeddings (local, no paid API — deliberate choice, see CLAUDE.md)
+# Embeddings (local, no paid API — deliberate choice, see docs/CLAUDE.md)
 sentence-transformers
 
-# Ingestion
+# openFDA ingestion (HTTP + JSON; no scraping, no PDF parsing)
 httpx
-pdfplumber
 
 # Testing
 pytest
